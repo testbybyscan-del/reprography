@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    container_name: reprography_app
+    ports:
+      - "8080:80"
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=repro
+      - DB_USER=app_user
+      - DB_PASSWORD=secret
+    depends_on:
+      - db
+    volumes:
+      - .:/var/www/html  # для горячей перезагрузки кода
+
+  db:
+    image: postgres:15
+    container_name: reprography_db
+    environment:
+      - POSTGRES_DB=repro
+      - POSTGRES_USER=app_user
+      - POSTGRES_PASSWORD=secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql  # скрипт инициализации
+
+volumes:
+  postgres_data:
