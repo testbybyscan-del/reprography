@@ -87,26 +87,31 @@ reprography/
 
 ## 📋 Примеры curl-запросов
 
-```bash
 # Загрузка изображения
+```bash
 curl -X POST http://localhost:8080/index.php/documents \
   -F "image=@/path/to/image.jpg" \
   -F "description=Мой снимок" \
   -F "metadata={\"author\":\"Bybyscan\",\"location\":\"Studio\"}"
-
+```
 # Получить список с поиском
+```bash
 curl "http://localhost:8080/index.php/documents?search=снимок&limit=10&offset=0"
-
+```
 # Получить метаданные
+```bash
 curl http://localhost:8080/index.php/documents/1
-
+```
 # Скачать оригинал
+```bash
 curl http://localhost:8080/index.php/documents/1/image --output original.jpg
-
+```
 # Скачать превью
+```bash
 curl http://localhost:8080/index.php/documents/1/thumb --output thumb.jpg
-
+```
 # Получить статистику
+```bash
 curl http://localhost:8080/index.php/stats
 ```
 
