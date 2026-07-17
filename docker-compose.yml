@@ -15,9 +15,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # В продакшене код не монтируется, но для разработки можно раскомментировать
-    # volumes:
-    #   - .:/var/www/html
+    # Монтирование локального кода для горячей перезагрузки (активировано для разработки)
+    volumes:
+      - .:/var/www/html
+    # Пользователь совпадает с www-data в контейнере, чтобы избежать проблем с правами
+    user: www-data
     restart: unless-stopped
     networks:
       - repro-network
