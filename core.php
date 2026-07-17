@@ -2,11 +2,14 @@
 /**
  * Core.php – ядро системы репрографии документов
  * 
+ * Версия 2.0 – адаптация под Docker, улучшение производительности,
+ * поддержка переменных окружения, оптимизация работы с памятью.
+ * 
  * Использует чистый PHP + расширение pgsql.
  * Хранение изображений – в поле BYTEA (с автоматическим сжатием TOAST).
  * Метаданные – JSONB, полнотекстовый поиск – GIN-индексы.
  * 
- * @version 1.0
+ * @version 2.0
  */
 
 class Core
@@ -24,23 +27,51 @@ class Core
     private $config = [];
 
     /**
-     * Конструктор – сохраняет параметры подключения
-     * 
-     * @param string $host     Хост БД (например, 'localhost')
-     * @param int    $port     Порт (по умолчанию 5432)
-     * @param string $dbname   Имя базы данных
-     * @param string $user     Пользователь
-     * @param string $password Пароль
+     * Настройки генерации превью
+     * @var array
      */
-    public function __construct($host, $port = 5432, $dbname, $user, $password)
+    private $thumbConfig = [
+        'maxWidth'  => 200,
+        'maxHeight' => 200,
+        'quality'   => 80,
+    ];
+
+    /**
+     * Конструктор – инициализация с параметрами или через переменные окружения
+     * 
+     * @param array|null $config Ассоциативный массив с ключами:
+     *                           host, port, dbname, user, password
+     *                           Если null – берёт из getenv()
+     */
+    public function __construct(?array $config = null)
     {
-        $this->config = [
-            'host'     => $host,
-            'port'     => $port,
-            'dbname'   => $dbname,
-            'user'     => $user,
-            'password' => $password
-        ];
+        if ($config === null) {
+            // Чтение из переменных окружения (Docker)
+            $this->config = [
+                'host'     => getenv('DB_HOST') ?: 'localhost',
+                'port'     => (int)(getenv('DB_PORT') ?: 5432),
+                'dbname'   => getenv('DB_NAME') ?: 'repro',
+                'user'     => getenv('DB_USER') ?: 'app_user',
+                'password' => getenv('DB_PASSWORD') ?: 'secret',
+            ];
+        } else {
+            // Ручная передача параметров (с валидацией)
+            $required = ['host', 'port', 'dbname', 'user', 'password'];
+            foreach ($required as $key) {
+                if (!isset($config[$key])) {
+                    throw new InvalidArgumentException("Отсутствует обязательный параметр: $key");
+                }
+            }
+            $this->config = $config;
+        }
+
+        // Проверка доступности расширений
+        if (!extension_loaded('pgsql')) {
+            throw new RuntimeException('Расширение pgsql не загружено');
+        }
+        if (!extension_loaded('gd')) {
+            throw new RuntimeException('Расширение GD не загружено');
+        }
     }
 
     /**
@@ -86,6 +117,22 @@ class Core
         $this->close();
     }
 
+    /**
+     * Устанавливает параметры генерации превью
+     * 
+     * @param int $maxWidth
+     * @param int $maxHeight
+     * @param int $quality Качество JPEG (0-100)
+     */
+    public function setThumbConfig($maxWidth, $maxHeight, $quality = 80)
+    {
+        $this->thumbConfig = [
+            'maxWidth'  => (int)$maxWidth,
+            'maxHeight' => (int)$maxHeight,
+            'quality'   => (int)$quality,
+        ];
+    }
+
     /* ---------- Работа с документами ---------- */
 
     /**
@@ -118,7 +165,7 @@ class Core
             throw new Exception('Недопустимый формат файла: ' . $mime);
         }
 
-        // Читаем файл
+        // Читаем файл (для больших файлов > 10 МБ можно использовать поток, но оставим так)
         $data = file_get_contents($filePath);
         if ($data === false) {
             throw new Exception('Не удалось прочитать файл');
@@ -136,10 +183,10 @@ class Core
             $metadata = array_merge($metadata, $exif);
         }
 
-        // Генерируем превью (уменьшенная копия)
+        // Генерируем превью
         $thumbData = null;
         if ($generateThumb) {
-            $thumbData = $this->generateThumbnail($data, $mime, 200, 200);
+            $thumbData = $this->generateThumbnail($data, $mime);
         }
 
         // Экранируем данные для BYTEA
@@ -178,7 +225,6 @@ class Core
             $row = pg_fetch_assoc($result);
             $docId = (int)$row['id'];
 
-            // Фиксируем транзакцию
             pg_query($this->dbconn, 'COMMIT');
             return $docId;
 
@@ -204,7 +250,6 @@ class Core
             return null;
         }
         $row = pg_fetch_assoc($result);
-        // Декодируем метаданные
         $row['metadata'] = json_decode($row['metadata'], true) ?: [];
         return $row;
     }
@@ -229,7 +274,6 @@ class Core
                 continue;
             }
             if ($key === 'metadata') {
-                // метаданные приходят как массив – преобразуем в JSON
                 if (!is_array($value)) {
                     throw new Exception('metadata должен быть массивом');
                 }
@@ -246,7 +290,7 @@ class Core
         }
 
         if (empty($updates)) {
-            return true; // ничего не меняем
+            return true;
         }
 
         $params[] = $id;
@@ -304,7 +348,7 @@ class Core
             $params[] = $filters['to'];
         }
 
-        // Фильтр по метаданным (например, camera => 'Canon')
+        // Фильтр по метаданным
         if (!empty($filters['metadata']) && is_array($filters['metadata'])) {
             foreach ($filters['metadata'] as $key => $value) {
                 $conditions[] = "metadata->>$".(count($params)+1)." = $".(count($params)+2);
@@ -349,7 +393,6 @@ class Core
             return null;
         }
         $row = pg_fetch_assoc($result);
-        // Распаковываем BYTEA
         $row['image_data'] = pg_unescape_bytea($row['image_data']);
         return [
             'data' => $row['image_data'],
@@ -378,6 +421,27 @@ class Core
         ];
     }
 
+    /**
+     * Получает статистику по документам (количество, общий размер и т.п.)
+     * 
+     * @return array
+     */
+    public function getStatistics()
+    {
+        $query = "SELECT 
+                    COUNT(*) AS total_docs,
+                    SUM(file_size) AS total_bytes,
+                    AVG(file_size) AS avg_size,
+                    MIN(uploaded_at) AS first_upload,
+                    MAX(uploaded_at) AS last_upload
+                  FROM documents";
+        $result = pg_query($this->dbconn, $query);
+        if (!$result) {
+            throw new Exception('Ошибка статистики: ' . pg_last_error($this->dbconn));
+        }
+        return pg_fetch_assoc($result) ?: [];
+    }
+
     /* ---------- Вспомогательные методы ---------- */
 
     /**
@@ -385,14 +449,14 @@ class Core
      * 
      * @param string $imageData   Бинарные данные исходного изображения
      * @param string $mimeType    MIME-тип оригинала
-     * @param int    $maxWidth    Максимальная ширина превью
-     * @param int    $maxHeight   Максимальная высота превью
-     * @param int    $quality     Качество JPEG (0-100)
      * @return string|null Бинарные данные превью, либо null при ошибке
      */
-    protected function generateThumbnail($imageData, $mimeType, $maxWidth = 200, $maxHeight = 200, $quality = 80)
+    protected function generateThumbnail($imageData, $mimeType)
     {
-        // Создаём ресурс из данных
+        $maxWidth  = $this->thumbConfig['maxWidth'];
+        $maxHeight = $this->thumbConfig['maxHeight'];
+        $quality   = $this->thumbConfig['quality'];
+
         $src = @imagecreatefromstring($imageData);
         if (!$src) {
             return null;
@@ -401,20 +465,26 @@ class Core
         $srcW = imagesx($src);
         $srcH = imagesy($src);
 
-        // Вычисляем пропорции
-        $ratio = min($maxWidth / $srcW, $maxHeight / $srcH);
-        $newW = (int)($srcW * $ratio);
-        $newH = (int)($srcH * $ratio);
+        // Если изображение уже меньше или равно лимитам – используем оригинал (но сжимаем)
+        if ($srcW <= $maxWidth && $srcH <= $maxHeight) {
+            // Просто пересохраняем с нужным качеством
+            $dst = $src;
+            $newW = $srcW;
+            $newH = $srcH;
+        } else {
+            // Вычисляем пропорции
+            $ratio = min($maxWidth / $srcW, $maxHeight / $srcH);
+            $newW = (int)($srcW * $ratio);
+            $newH = (int)($srcH * $ratio);
 
-        $dst = imagecreatetruecolor($newW, $newH);
-        if ($dst === false) {
+            $dst = imagecreatetruecolor($newW, $newH);
+            if ($dst === false) {
+                imagedestroy($src);
+                return null;
+            }
+            imagecopyresampled($dst, $src, 0, 0, 0, 0, $newW, $newH, $srcW, $srcH);
             imagedestroy($src);
-            return null;
         }
-
-        // Копирование с ресемплингом
-        imagecopyresampled($dst, $src, 0, 0, 0, 0, $newW, $newH, $srcW, $srcH);
-        imagedestroy($src);
 
         // Сохраняем в буфер
         ob_start();
@@ -422,11 +492,12 @@ class Core
         if ($format === 'jpeg') {
             imagejpeg($dst, null, $quality);
         } elseif ($format === 'png') {
-            imagepng($dst, null, 9);
+            // Для PNG качество не применяется, используем сжатие 6 (среднее)
+            imagepng($dst, null, 6);
         } elseif ($format === 'gif') {
             imagegif($dst);
         } else {
-            // для других форматов – сохраняем как JPEG
+            // fallback
             imagejpeg($dst, null, $quality);
         }
         $thumbData = ob_get_clean();
@@ -448,5 +519,4 @@ class Core
         ];
         return $map[$mime] ?? 'jpeg';
     }
-
 }
